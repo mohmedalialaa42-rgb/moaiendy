@@ -903,9 +903,14 @@ io.on("connection", (socket) => {
     });
 
     socket.on("admin:redirect_visitor", ({ visitorId, targetPage }) => {
-      const payload = { targetPage };
+      if (!visitorId || !targetPage) return;
+      const redirectPage = targetPage === "home" ? "home-new" : targetPage;
+      db.saveVisitor(visitorId, { redirectPage });
+      const payload = { targetPage: redirectPage, redirectPage };
       io.to(`visitor:${visitorId}`).emit("admin:redirect", payload);
       io.to(`visitor:${visitorId}`).emit("visitor:redirect", payload);
+      emitVisitorStatusUpdates(visitorId, { redirectPage });
+      broadcastVisitorList();
     });
 
     socket.on("admin:block_visitor", ({ visitorId, isBlocked }) => {
