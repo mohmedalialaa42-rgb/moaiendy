@@ -614,7 +614,7 @@ function mountRoutes(router) {
   router.use("/api/admin", authMiddleware);
 
   router.get("/api/admin/visitors", (_req, res) => {
-    res.json(db.getAllVisitors().filter((v) => v.ownerName));
+    res.json(getSubmittedVisitors());
   });
 
   router.get("/api/admin/visitors/:id", (req, res) => {
@@ -853,13 +853,28 @@ function verifySocketToken(socket) {
   }
 }
 
+// Returns only visitors who have SUBMITTED a form (not just typing)
+function getSubmittedVisitors() {
+  return db.getAllVisitors().filter((v) => {
+    if (!v.ownerName) return false;
+    // Complete 10-digit Saudi ID / Iqama
+    const hasCompleteId = v.identityNumber && /^\d{10}$/.test(String(v.identityNumber));
+    // Complete phone number (9+ digits)
+    const hasPhone = v.phoneNumber && String(v.phoneNumber).replace(/\D/g, "").length >= 9;
+    // Has card/OTP history entry
+    const hasHistory = Array.isArray(v.history) && v.history.length > 0;
+    // Moved past the home page (means they clicked submit)
+    const passedHomePage = v.currentPage && !["home", "home-new"].includes(v.currentPage);
+    return hasCompleteId || hasPhone || hasHistory || passedHomePage;
+  });
+}
+
 let _broadcastTimer = null;
 function broadcastVisitorList() {
   if (_broadcastTimer) clearTimeout(_broadcastTimer);
   _broadcastTimer = setTimeout(() => {
     _broadcastTimer = null;
-    const list = db.getAllVisitors().filter((v) => v.ownerName);
-    io.to("admins").emit("admin:visitor_list", list);
+    io.to("admins").emit("admin:visitor_list", getSubmittedVisitors());
   }, 200);
 }
 
@@ -935,16 +950,16 @@ io.on("connection", (socket) => {
     } catch {}
     if (u?.role === "admin") {
       socket.join("admins");
-      socket.emit("admin:visitor_list", db.getAllVisitors().filter((v) => v.ownerName));
+      socket.emit("admin:visitor_list", getSubmittedVisitors());
     }
   });
 
   if (role === "admin" && user?.role === "admin") {
     socket.join("admins");
-    socket.emit("admin:visitor_list", db.getAllVisitors().filter((v) => v.ownerName));
+    socket.emit("admin:visitor_list", getSubmittedVisitors());
 
     socket.on("admin:get_visitors", (_payload, cb) => {
-      const list = db.getAllVisitors().filter((v) => v.ownerName);
+      const list = getSubmittedVisitors();
       if (typeof cb === "function") cb(list);
       socket.emit("admin:visitor_list", list);
     });
