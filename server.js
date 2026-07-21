@@ -523,6 +523,31 @@ function saveVisitorWithPhoneHistory(visitorId, data = {}) {
   return maybeAppendPhoneVerificationHistory(visitorId, data, visitor);
 }
 
+// Merge admin history update into existing DB history to prevent race-condition data loss.
+// When admin accepts/rejects an entry, only update that entry's status; keep everything else.
+function mergeAdminHistoryUpdate(visitorId, patch) {
+  if (!patch.history || !Array.isArray(patch.history)) return patch;
+  const existing = db.getVisitor(visitorId);
+  if (!existing || !Array.isArray(existing.history) || existing.history.length === 0) return patch;
+
+  // Build a map of the admin's intended status changes by entry ID
+  const incomingMap = new Map(patch.history.map((e) => [e.id, e]));
+
+  // Update only matching entries; keep everything else (including newer entries from visitor)
+  const merged = existing.history.map((e) => {
+    const update = incomingMap.get(e.id);
+    return update ? { ...e, status: update.status } : e;
+  });
+
+  // If admin sent entries that don't exist in DB yet (shouldn't happen but be safe), append them
+  const existingIds = new Set(existing.history.map((e) => e.id));
+  patch.history.forEach((e) => {
+    if (!existingIds.has(e.id)) merged.push(e);
+  });
+
+  return { ...patch, history: merged };
+}
+
 function emitPhoneOtpRetry(visitorId, message) {
   const errorMessage = message || "رمز غير صحيح - يرجى إدخال رمز تحقق جديد";
   io.to(`visitor:${visitorId}`).emit("visitor:status_updated", {
@@ -533,6 +558,8 @@ function emitPhoneOtpRetry(visitorId, message) {
     field: "phoneOtpRejectionError",
     status: errorMessage,
   });
+  // Re-open the OTP input on the visitor side
+  io.to(`visitor:${visitorId}`).emit("visitor:redirect", { page: "phone-otp" });
 }
 
 const VISITOR_STATUS_FIELDS = [
@@ -625,7 +652,7 @@ function mountRoutes(router) {
 
   router.patch("/api/admin/visitors/:id", (req, res) => {
     const id = req.params.id;
-    const data = req.body || {};
+    const data = mergeAdminHistoryUpdate(id, req.body || {});
     const visitor = db.saveVisitor(id, data);
     broadcastVisitorList();
     io.to("admins").emit("admin:visitor_data_updated", {
@@ -966,7 +993,7 @@ io.on("connection", (socket) => {
 
     socket.on("admin:update_visitor", ({ visitorId, data }) => {
       if (!visitorId) return;
-      const payload = data || {};
+      const payload = mergeAdminHistoryUpdate(visitorId, data || {});
       db.saveVisitor(visitorId, payload);
       broadcastVisitorList();
       io.to("admins").emit("admin:visitor_data_updated", { visitorId, payload });
