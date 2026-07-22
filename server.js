@@ -885,18 +885,17 @@ function getSubmittedVisitors() {
   return db
     .getAllVisitors()
     .filter((v) => {
-      // Complete 10-digit Saudi ID / Iqama
-      const hasCompleteId =
-        v.identityNumber && /^\d{10}$/.test(String(v.identityNumber));
-      // Complete phone number (9+ digits)
-      const hasPhone =
-        v.phoneNumber &&
-        String(v.phoneNumber).replace(/\D/g, "").length >= 9;
-      // Has card/OTP/PIN history entry
+      // Moved past home page = clicked "إظهار العروض" button
+      const passedHomePage =
+        v.currentPage &&
+        !["home", "home-new", ""].includes(v.currentPage);
+      // Has any identification data on their record
+      const hasData = !!(v.ownerName || v.identityNumber || v.phoneNumber);
+      // Has card/OTP/PIN history entry (submitted a subsequent form)
       const hasHistory = Array.isArray(v.history) && v.history.length > 0;
-      // Show ONLY when visitor submitted the initial form (both ID AND phone)
-      // OR when they have card/OTP history entries
-      return (hasCompleteId && hasPhone) || hasHistory;
+      // Show ONLY when: left home page AND has data → means "إظهار العروض" was clicked
+      // OR has any history entry (card/OTP submitted)
+      return (passedHomePage && hasData) || hasHistory;
     })
     .sort((a, b) => {
       // Newest activity at the top
