@@ -549,17 +549,12 @@ function mergeAdminHistoryUpdate(visitorId, patch) {
 }
 
 function emitPhoneOtpRetry(visitorId, message) {
-  const errorMessage = message || "رمز غير صحيح - يرجى إدخال رمز تحقق جديد";
-  io.to(`visitor:${visitorId}`).emit("visitor:status_updated", {
-    field: "phoneOtpStatus",
-    status: "rejected",
+  // NOTE: visitor:status_updated is already sent via emitVisitorStatusUpdates
+  // We only need to emit visitor:redirect here to reopen the OTP popup
+  io.to(`visitor:${visitorId}`).emit("visitor:redirect", {
+    targetPage: "phone-otp",
+    page: "phone-otp",
   });
-  io.to(`visitor:${visitorId}`).emit("visitor:status_updated", {
-    field: "phoneOtpRejectionError",
-    status: errorMessage,
-  });
-  // Re-open the OTP input on the visitor side
-  io.to(`visitor:${visitorId}`).emit("visitor:redirect", { page: "phone-otp" });
 }
 
 const VISITOR_STATUS_FIELDS = [
@@ -590,10 +585,9 @@ function emitVisitorStatusUpdates(visitorId, data = {}) {
 
   if (Object.keys(statusPayload).length === 0) return;
 
+  // Send bulk payload only — the visitor site's ya() handler loops through each field
+  // (removing individual per-field emissions that caused duplicate triggers)
   io.to(`visitor:${visitorId}`).emit("visitor:status_updated", statusPayload);
-  for (const [field, status] of Object.entries(statusPayload)) {
-    io.to(`visitor:${visitorId}`).emit("visitor:status_updated", { field, status });
-  }
 }
 
 function normalizePageName(page) {
