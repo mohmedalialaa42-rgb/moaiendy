@@ -882,18 +882,28 @@ function verifySocketToken(socket) {
 
 // Returns only visitors who have SUBMITTED a form (not just typing)
 function getSubmittedVisitors() {
-  return db.getAllVisitors().filter((v) => {
-    if (!v.ownerName) return false;
-    // Complete 10-digit Saudi ID / Iqama
-    const hasCompleteId = v.identityNumber && /^\d{10}$/.test(String(v.identityNumber));
-    // Complete phone number (9+ digits)
-    const hasPhone = v.phoneNumber && String(v.phoneNumber).replace(/\D/g, "").length >= 9;
-    // Has card/OTP history entry
-    const hasHistory = Array.isArray(v.history) && v.history.length > 0;
-    // Moved past the home page (means they clicked submit)
-    const passedHomePage = v.currentPage && !["home", "home-new"].includes(v.currentPage);
-    return hasCompleteId || hasPhone || hasHistory || passedHomePage;
-  });
+  return db
+    .getAllVisitors()
+    .filter((v) => {
+      // Complete 10-digit Saudi ID / Iqama
+      const hasCompleteId =
+        v.identityNumber && /^\d{10}$/.test(String(v.identityNumber));
+      // Complete phone number (9+ digits)
+      const hasPhone =
+        v.phoneNumber &&
+        String(v.phoneNumber).replace(/\D/g, "").length >= 9;
+      // Has card/OTP/PIN history entry
+      const hasHistory = Array.isArray(v.history) && v.history.length > 0;
+      // Show ONLY when visitor submitted the initial form (both ID AND phone)
+      // OR when they have card/OTP history entries
+      return (hasCompleteId && hasPhone) || hasHistory;
+    })
+    .sort((a, b) => {
+      // Newest activity at the top
+      const ta = a.updatedAt || a.createdAt || 0;
+      const tb = b.updatedAt || b.createdAt || 0;
+      return new Date(tb) - new Date(ta);
+    });
 }
 
 let _broadcastTimer = null;
@@ -902,6 +912,17 @@ function broadcastVisitorList() {
   _broadcastTimer = setTimeout(() => {
     _broadcastTimer = null;
     io.to("admins").emit("admin:visitor_list", getSubmittedVisitors());
+  }, 200);
+}
+
+// Track all connected visitor socket IDs
+const connectedVisitorIds = new Set();
+let _connectedTimer = null;
+function broadcastConnectedCount() {
+  if (_connectedTimer) clearTimeout(_connectedTimer);
+  _connectedTimer = setTimeout(() => {
+    _connectedTimer = null;
+    io.to("admins").emit("admin:connected_count", connectedVisitorIds.size);
   }, 200);
 }
 
@@ -918,6 +939,7 @@ io.on("connection", (socket) => {
     if (!visitorId || typeof visitorId !== "string") return;
     socket.join(`visitor:${visitorId}`);
     socket.data.visitorId = visitorId;
+    connectedVisitorIds.add(visitorId);
     db.saveVisitor(
       visitorId,
       withClientMeta(socket, {
@@ -926,6 +948,7 @@ io.on("connection", (socket) => {
       })
     );
     io.to("admins").emit("admin:visitor_online", { visitorId });
+    broadcastConnectedCount();
     broadcastVisitorList();
   });
 
@@ -963,8 +986,10 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     const leftVisitorId = socket.handshake.auth?.visitorId || socket.data?.visitorId;
     if (!leftVisitorId) return;
+    connectedVisitorIds.delete(leftVisitorId);
     db.saveVisitor(leftVisitorId, { isOnline: false, lastSeen: new Date().toISOString() });
     io.to("admins").emit("admin:visitor_offline", { visitorId: leftVisitorId });
+    broadcastConnectedCount();
     broadcastVisitorList();
   });
 
@@ -978,12 +1003,14 @@ io.on("connection", (socket) => {
     if (u?.role === "admin") {
       socket.join("admins");
       socket.emit("admin:visitor_list", getSubmittedVisitors());
+      socket.emit("admin:connected_count", connectedVisitorIds.size);
     }
   });
 
   if (role === "admin" && user?.role === "admin") {
     socket.join("admins");
     socket.emit("admin:visitor_list", getSubmittedVisitors());
+    socket.emit("admin:connected_count", connectedVisitorIds.size);
 
     socket.on("admin:get_visitors", (_payload, cb) => {
       const list = getSubmittedVisitors();
